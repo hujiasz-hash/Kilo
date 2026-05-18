@@ -162,11 +162,19 @@ class CalorieDB:
         if not foods:
             raise ValueError("没有食物数据")
 
+        # 兼容两种字段名: "carbs" (输入JSON) 和 "carbs_g" (标准字段)
+        def _get(food, *keys):
+            for k in keys:
+                v = food.get(k)
+                if v is not None:
+                    return v
+            return 0
+
         total_cal = sum(f.get("calories", 0) for f in foods)
-        total_carbs = sum(f.get("carbs_g", 0) for f in foods)
-        total_protein = sum(f.get("protein_g", 0) for f in foods)
-        total_fat = sum(f.get("fat_g", 0) for f in foods)
-        total_fiber = sum(f.get("fiber_g", 0) for f in foods)
+        total_carbs = sum(_get(f, "carbs_g", "carbs") for f in foods)
+        total_protein = sum(_get(f, "protein_g", "protein") for f in foods)
+        total_fat = sum(_get(f, "fat_g", "fat") for f in foods)
+        total_fiber = sum(_get(f, "fiber_g", "fiber") for f in foods)
 
         with self._conn() as db:
             db.execute(
@@ -291,11 +299,18 @@ class CalorieDB:
         if "foods" in data:
             foods = data["foods"]
             fields.append("foods_json = ?"); vals.append(json.dumps(foods, ensure_ascii=False))
+            def _get(food, *keys):
+                for k in keys:
+                    v = food.get(k)
+                    if v is not None:
+                        return v
+                return 0
+
             fields.append("total_calories = ?"); vals.append(sum(f.get("calories", 0) for f in foods))
-            fields.append("total_carbs = ?"); vals.append(sum(f.get("carbs_g", 0) for f in foods))
-            fields.append("total_protein = ?"); vals.append(sum(f.get("protein_g", 0) for f in foods))
-            fields.append("total_fat = ?"); vals.append(sum(f.get("fat_g", 0) for f in foods))
-            fields.append("total_fiber = ?"); vals.append(sum(f.get("fiber_g", 0) for f in foods))
+            fields.append("total_carbs = ?"); vals.append(sum(_get(f, "carbs_g", "carbs") for f in foods))
+            fields.append("total_protein = ?"); vals.append(sum(_get(f, "protein_g", "protein") for f in foods))
+            fields.append("total_fat = ?"); vals.append(sum(_get(f, "fat_g", "fat") for f in foods))
+            fields.append("total_fiber = ?"); vals.append(sum(_get(f, "fiber_g", "fiber") for f in foods))
         if "image_desc" in data:
             fields.append("image_desc = ?"); vals.append(data["image_desc"])
 
