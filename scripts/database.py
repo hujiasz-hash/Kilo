@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
+from rapidfuzz import fuzz, process as rf_process
+
 from config import DB_PATH, FOODS_CSV
 
 SCHEMA = """
@@ -457,15 +459,56 @@ class CalorieDB:
                        (f"（条码：{data['barcode']}）" if data.get("barcode") else ""),
         }
 
+    @staticmethod
+    def _ngram_chunks(keyword, size=2):
+        """将关键词切成 n-gram 片段用于宽松匹配"""
+        if len(keyword) <= size:
+            return [keyword]
+        return [keyword[i:i+size] for i in range(len(keyword) - size + 1)]
+
+    @staticmethod
+    def _fuzzy_score(keyword, target):
+        """综合 N-gram 命中率 + 字符交集比 + partial_ratio 评分
+
+        中文没有空格分词，token_set_ratio 效果差，
+        改用字符集交集比例 + partial_ratio 组合更适合中文食物名。
+        """
+        # 1) N-gram 命中分
+        chunks = CalorieDB._ngram_chunks(keyword)
+        ngram_score = sum(1 for c in chunks if c in target) / len(chunks) * 100 if chunks else 0
+
+        # 2) 字符交集比 (keyword 中有多少字符出现在 target 中)
+        kw_chars = set(keyword)
+        tgt_chars = set(target)
+        char_overlap = len(kw_chars & tgt_chars) / len(kw_chars) * 100 if kw_chars else 0
+
+        # 3) partial_ratio (子串模糊匹配)
+        partial = fuzz.partial_ratio(keyword, target)
+
+        # 加权：字符交集 35% + N-gram 25% + partial_ratio 40%
+        return char_overlap * 0.35 + ngram_score * 0.25 + partial * 0.40
+
     def food_search(self, keyword):
+        """模糊搜索自定义食物：N-gram + RapidFuzz 综合评分"""
         with self._conn() as db:
-            rows = db.execute(
-                "SELECT * FROM custom_foods WHERE name LIKE ? ORDER BY name ASC",
-                (f"%{keyword}%",),
-            ).fetchall()
-        foods = [self._format_custom_food(r) for r in rows]
+            rows = db.execute("SELECT * FROM custom_foods ORDER BY name ASC").fetchall()
+
+        if not rows:
+            return {"status": "ok", "foods": [], "message": "自定义食物库为空"}
+
+        # 计算每条的综合得分
+        scored = []
+        for r in rows:
+            score = self._fuzzy_score(keyword, r["name"])
+            if score >= 45:  # 最低阈值：卡掉单字误匹配
+                scored.append((score, r))
+
+        # 按得分降序，取 Top 5
+        scored.sort(key=lambda x: -x[0])
+        foods = [self._format_custom_food(r) for _, r in scored[:5]]
+
         if not foods:
-            return {"status": "ok", "foods": [], "message": f"未找到包含「{keyword}」的食物"}
+            return {"status": "ok", "foods": [], "message": f"未找到与「{keyword}」匹配的食物"}
         return {"status": "ok", "foods": foods}
 
     def food_barcode(self, barcode):
@@ -530,26 +573,36 @@ class CalorieDB:
     # ─── foods.csv 查询 ─────────────────────────────────────────
 
     def foods_lookup(self, keyword):
-        """在 foods.csv 中搜索食物参考数据"""
+        """在 foods.csv 中模糊搜索食物参考数据"""
         if not os.path.exists(FOODS_CSV):
             return {"status": "error", "message": "foods.csv 不存在"}
 
         import csv
-        results = []
+        all_items = []
         with open(FOODS_CSV, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if keyword in row.get("食物名称", ""):
-                    results.append({
-                        "category": row.get("分类", ""),
-                        "name": row["食物名称"],
-                        "calories": float(row.get("每100g热量(kcal)", 0)),
-                        "carbs_g": float(row.get("碳水(g)", 0)),
-                        "protein_g": float(row.get("蛋白质(g)", 0)),
-                        "fat_g": float(row.get("脂肪(g)", 0)),
-                        "fiber_g": float(row.get("膳食纤维(g)", 0)),
-                        "note": row.get("备注", ""),
-                    })
+                all_items.append({
+                    "category": row.get("分类", ""),
+                    "name": row["食物名称"],
+                    "calories": float(row.get("每100g热量(kcal)", 0)),
+                    "carbs_g": float(row.get("碳水(g)", 0)),
+                    "protein_g": float(row.get("蛋白质(g)", 0)),
+                    "fat_g": float(row.get("脂肪(g)", 0)),
+                    "fiber_g": float(row.get("膳食纤维(g)", 0)),
+                    "note": row.get("备注", ""),
+                })
+
+        # 模糊评分
+        scored = []
+        for item in all_items:
+            score = self._fuzzy_score(keyword, item["name"])
+            if score >= 45:
+                scored.append((score, item))
+
+        scored.sort(key=lambda x: -x[0])
+        results = [item for _, item in scored[:10]]
+
         return {"status": "ok", "keyword": keyword, "count": len(results), "foods": results}
 
     # ─── 体重记录 ───────────────────────────────────────────────
