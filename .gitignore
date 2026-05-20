@@ -8,3 +8,9 @@ __pycache__/
 .venv/
 venv/
 .claude/
+
+# 旧数据库（已迁移到 records.db）
+calories.db
+
+# 个人记录不进 git（存在 ~/.openclaw/data/ 下）
+records.db

@@ -1,5 +1,6 @@
-"""卡路里追踪数据存储 — SQLite 封装"""
+"""卡路里追踪数据存储 — 拆分为 FoodsDB (食物库) + RecordsDB (个人记录)"""
 
+import csv
 import json
 import os
 import sqlite3
@@ -8,26 +9,23 @@ from contextlib import contextmanager
 
 from rapidfuzz import fuzz, process as rf_process
 
-from config import DB_PATH, FOODS_CSV
+from config import RECORDS_DB, FOODS_DB, FOODS_SQL
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS meals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    meal_time TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    meal_type TEXT DEFAULT '',
-    foods_json TEXT NOT NULL,
-    total_calories REAL DEFAULT 0,
-    total_carbs REAL DEFAULT 0,
-    total_protein REAL DEFAULT 0,
-    total_fat REAL DEFAULT 0,
-    total_fiber REAL DEFAULT 0,
-    image_desc TEXT DEFAULT ''
-);
+# ═══════════════════════════════════════════════════════════════
+# Schema
+# ═══════════════════════════════════════════════════════════════
 
-CREATE TABLE IF NOT EXISTS goals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    calorie_goal INTEGER NOT NULL DEFAULT 2000,
-    set_date TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+FOODS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS static_foods (
+    id INTEGER PRIMARY KEY,
+    category TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL,
+    calories_per_100g REAL DEFAULT 0,
+    carbs_per_100g REAL DEFAULT 0,
+    protein_per_100g REAL DEFAULT 0,
+    fat_per_100g REAL DEFAULT 0,
+    fiber_per_100g REAL DEFAULT 0,
+    note TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS custom_foods (
@@ -46,8 +44,30 @@ CREATE TABLE IF NOT EXISTS custom_foods (
     image_desc TEXT DEFAULT ''
 );
 
-CREATE INDEX IF NOT EXISTS idx_custom_foods_barcode ON custom_foods(barcode);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_custom_foods_barcode ON custom_foods(barcode);
 CREATE INDEX IF NOT EXISTS idx_custom_foods_name ON custom_foods(name);
+CREATE INDEX IF NOT EXISTS idx_static_foods_name ON static_foods(name);
+"""
+
+RECORDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    meal_time TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    meal_type TEXT DEFAULT '',
+    foods_json TEXT NOT NULL,
+    total_calories REAL DEFAULT 0,
+    total_carbs REAL DEFAULT 0,
+    total_protein REAL DEFAULT 0,
+    total_fat REAL DEFAULT 0,
+    total_fiber REAL DEFAULT 0,
+    image_desc TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    calorie_goal INTEGER NOT NULL DEFAULT 2000,
+    set_date TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 
 CREATE TABLE IF NOT EXISTS macro_goals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,9 +90,276 @@ CREATE INDEX IF NOT EXISTS idx_weight_date ON weight_records(recorded_at);
 """
 
 
-class CalorieDB:
+# ═══════════════════════════════════════════════════════════════
+# FoodsDB — 食物参考库 (static_foods + custom_foods)
+# ═══════════════════════════════════════════════════════════════
+
+class FoodsDB:
+    """管理食物参考库：static_foods (只读) + custom_foods (可读写)"""
+
+    def __init__(self, db_path=None, sql_path=None):
+        self.db_path = db_path or FOODS_DB
+        self.sql_path = sql_path or FOODS_SQL
+        self._ensure_db()
+
+    def _ensure_db(self):
+        """如果 foods.db 不存在，从 foods.sql 构建"""
+        if os.path.exists(self.db_path):
+            return
+        if os.path.exists(self.sql_path):
+            self._build_from_sql()
+
+    def _build_from_sql(self):
+        """从 foods.sql 文本文件构建 foods.db"""
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        conn = sqlite3.connect(self.db_path)
+        with open(self.sql_path, "r", encoding="utf-8") as f:
+            conn.executescript(f.read())
+        conn.commit()
+        conn.close()
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(FOODS_SCHEMA)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ─── 查询（统一入口）──────────────────────────────────────
+
+    def lookup(self, keyword):
+        """统一食物查询：先 custom_foods，再 static_foods"""
+        results = []
+
+        with self._conn() as db:
+            # 1. custom_foods（用户精确数据优先）
+            custom_rows = db.execute(
+                "SELECT * FROM custom_foods WHERE name LIKE ?",
+                (f"%{keyword}%",),
+            ).fetchall()
+            for r in custom_rows:
+                results.append({
+                    "source": "custom",
+                    "category": "自定义",
+                    "name": r["name"],
+                    "calories": round(r["calories_per_100g"] or 0, 1),
+                    "carbs_g": round(r["carbs_per_100g"] or 0, 1),
+                    "protein_g": round(r["protein_per_100g"] or 0, 1),
+                    "fat_g": round(r["fat_per_100g"] or 0, 1),
+                    "fiber_g": round(r["fiber_per_100g"] or 0, 1),
+                    "note": "",
+                })
+
+            # 2. static_foods（参考数据）
+            static_rows = db.execute(
+                "SELECT * FROM static_foods WHERE name LIKE ?",
+                (f"%{keyword}%",),
+            ).fetchall()
+            for r in static_rows:
+                results.append({
+                    "source": "static",
+                    "category": r["category"],
+                    "name": r["name"],
+                    "calories": round(r["calories_per_100g"] or 0, 1),
+                    "carbs_g": round(r["carbs_per_100g"] or 0, 1),
+                    "protein_g": round(r["protein_per_100g"] or 0, 1),
+                    "fat_g": round(r["fat_per_100g"] or 0, 1),
+                    "fiber_g": round(r["fiber_per_100g"] or 0, 1),
+                    "note": r["note"] or "",
+                })
+
+            # 3. 如果精确匹配不到，用模糊搜索
+            if not results:
+                all_static = db.execute("SELECT * FROM static_foods").fetchall()
+                all_custom = db.execute("SELECT * FROM custom_foods").fetchall()
+
+                static_names = {r["name"]: dict(r) for r in all_static}
+                custom_names = {r["name"]: dict(r) for r in all_custom}
+                all_names = list(static_names.keys()) + list(custom_names.keys())
+
+                if all_names:
+                    matches = rf_process.extract(keyword, all_names, scorer=fuzz.token_sort_ratio, limit=10)
+                    for match_name, score, _ in matches:
+                        if score < 50:
+                            continue
+                        if match_name in custom_names:
+                            r = custom_names[match_name]
+                            results.append({
+                                "source": "custom",
+                                "category": "自定义",
+                                "name": r["name"],
+                                "calories": round(r["calories_per_100g"] or 0, 1),
+                                "carbs_g": round(r["carbs_per_100g"] or 0, 1),
+                                "protein_g": round(r["protein_per_100g"] or 0, 1),
+                                "fat_g": round(r["fat_per_100g"] or 0, 1),
+                                "fiber_g": round(r["fiber_per_100g"] or 0, 1),
+                                "note": "",
+                            })
+                        if match_name in static_names:
+                            r = static_names[match_name]
+                            results.append({
+                                "source": "static",
+                                "category": r["category"],
+                                "name": r["name"],
+                                "calories": round(r["calories_per_100g"] or 0, 1),
+                                "carbs_g": round(r["carbs_per_100g"] or 0, 1),
+                                "protein_g": round(r["protein_per_100g"] or 0, 1),
+                                "fat_g": round(r["fat_per_100g"] or 0, 1),
+                                "fiber_g": round(r["fiber_per_100g"] or 0, 1),
+                                "note": r["note"] or "",
+                            })
+
+        return {"status": "ok", "keyword": keyword, "count": len(results), "foods": results}
+
+    # ─── custom_foods 写操作 ──────────────────────────────────
+
+    def food_search(self, keyword):
+        """搜索自定义食物库"""
+        with self._conn() as db:
+            rows = db.execute(
+                "SELECT * FROM custom_foods WHERE name LIKE ? OR brand LIKE ?",
+                (f"%{keyword}%", f"%{keyword}%"),
+            ).fetchall()
+        foods = [self._format_custom_food(r) for r in rows]
+        return {"status": "ok", "foods": foods} if foods else \
+            {"status": "ok", "foods": [], "message": f"未找到与「{keyword}」匹配的食物"}
+
+    def food_barcode(self, code):
+        """按条码查询"""
+        with self._conn() as db:
+            row = db.execute("SELECT * FROM custom_foods WHERE barcode = ?", (code,)).fetchone()
+        if row:
+            return {"status": "ok", "food": self._format_custom_food(row)}
+        return {"status": "not_found", "message": f"条码 {code} 未找到"}
+
+    def food_add(self, data):
+        """添加自定义食物，同时同步到 foods.sql"""
+        with self._conn() as db:
+            db.execute(
+                """INSERT INTO custom_foods (name, barcode, brand, serving_size_g, serving_desc,
+                   calories_per_100g, carbs_per_100g, protein_per_100g, fat_per_100g, fiber_per_100g, image_desc)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (data["name"], data.get("barcode"), data.get("brand", ""),
+                 data.get("serving_size_g"), data.get("serving_desc", ""),
+                 data.get("calories_per_100g", 0), data.get("carbs_per_100g", 0),
+                 data.get("protein_per_100g", 0), data.get("fat_per_100g", 0),
+                 data.get("fiber_per_100g", 0), data.get("image_desc", "")),
+            )
+            food_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            row = db.execute("SELECT * FROM custom_foods WHERE id = ?", (food_id,)).fetchone()
+
+        # 同步到 foods.sql
+        self._sync_sql()
+        return {"status": "ok", "id": food_id, "food": self._format_custom_food(row)}
+
+    def food_update(self, food_id, data):
+        """更新自定义食物"""
+        fields, vals = [], []
+        for col in ["name", "barcode", "brand", "serving_size_g", "serving_desc",
+                     "calories_per_100g", "carbs_per_100g", "protein_per_100g",
+                     "fat_per_100g", "fiber_per_100g", "image_desc"]:
+            if col in data:
+                fields.append(f"{col} = ?")
+                vals.append(data[col])
+        if not fields:
+            return {"status": "error", "message": "没有更新字段"}
+        vals.append(int(food_id))
+        with self._conn() as db:
+            db.execute(f"UPDATE custom_foods SET {', '.join(fields)} WHERE id = ?", vals)
+        self._sync_sql()
+        return {"status": "ok", "updated_id": int(food_id)}
+
+    def food_delete(self, food_id):
+        """删除自定义食物"""
+        with self._conn() as db:
+            db.execute("DELETE FROM custom_foods WHERE id = ?", (int(food_id),))
+            affected = db.execute("SELECT changes()").fetchone()[0]
+        self._sync_sql()
+        if affected:
+            return {"status": "ok", "deleted_id": int(food_id)}
+        return {"status": "error", "message": f"未找到 ID {food_id}"}
+
+    def food_list(self):
+        """列出所有自定义食物"""
+        with self._conn() as db:
+            rows = db.execute("SELECT * FROM custom_foods ORDER BY id DESC").fetchall()
+        return {"status": "ok", "foods": [self._format_custom_food(r) for r in rows]}
+
+    # ─── foods.sql 同步 ───────────────────────────────────────
+
+    def _sync_sql(self):
+        """将 foods.db 的全部内容导出到 foods.sql"""
+        with self._conn() as db:
+            static_rows = db.execute("SELECT * FROM static_foods ORDER BY id").fetchall()
+            custom_rows = db.execute("SELECT * FROM custom_foods ORDER BY id").fetchall()
+
+        with open(self.sql_path, "w", encoding="utf-8") as f:
+            f.write("-- 食物参考库 (auto-generated, do not edit manually)\n")
+            f.write("-- static_foods: 常见食物标准数据\n")
+            f.write("-- custom_foods: 用户录入数据\n\n")
+            f.write(FOODS_SCHEMA.strip())
+            f.write("\n\n")
+
+            f.write("-- ─── static_foods ────────────────────────────────────────\n\n")
+            for r in static_rows:
+                f.write(
+                    f"INSERT INTO static_foods VALUES ({r['id']},"
+                    f"'{r['category']}','{r['name']}',"
+                    f"{r['calories_per_100g']},{r['carbs_per_100g']},"
+                    f"{r['protein_per_100g']},{r['fat_per_100g']},"
+                    f"{r['fiber_per_100g']},'{r['note']}');\n"
+                )
+
+            f.write("\n-- ─── custom_foods ────────────────────────────────────────\n\n")
+            for r in custom_rows:
+                f.write(
+                    f"INSERT INTO custom_foods VALUES ({r['id']},"
+                    f"'{r['name'].replace(chr(39), chr(39)+chr(39))}',"
+                    f"'{(r['barcode'] or '').replace(chr(39), chr(39)+chr(39))}',"
+                    f"'{(r['brand'] or '').replace(chr(39), chr(39)+chr(39))}',"
+                    f"{r['serving_size_g'] or 'NULL'},"
+                    f"'{(r['serving_desc'] or '').replace(chr(39), chr(39)+chr(39))}',"
+                    f"{r['calories_per_100g'] or 0},{r['carbs_per_100g'] or 0},"
+                    f"{r['protein_per_100g'] or 0},{r['fat_per_100g'] or 0},"
+                    f"{r['fiber_per_100g'] or 0},"
+                    f"'{(r['added_date'] or '').replace(chr(39), chr(39)+chr(39))}',"
+                    f"'{(r['image_desc'] or '').replace(chr(39), chr(39)+chr(39))}');\n"
+                )
+
+    # ─── helper ───────────────────────────────────────────────
+
+    @staticmethod
+    def _format_custom_food(row):
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "barcode": row["barcode"],
+            "brand": row["brand"],
+            "serving_size_g": row["serving_size_g"],
+            "serving_desc": row["serving_desc"],
+            "calories_per_100g": round(row["calories_per_100g"] or 0, 1),
+            "carbs_per_100g": round(row["carbs_per_100g"] or 0, 1),
+            "protein_per_100g": round(row["protein_per_100g"] or 0, 1),
+            "fat_per_100g": round(row["fat_per_100g"] or 0, 1),
+            "fiber_per_100g": round(row["fiber_per_100g"] or 0, 1),
+            "added_date": row["added_date"],
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# RecordsDB — 个人记录 (meals, goals, macro_goals, weight)
+# ═══════════════════════════════════════════════════════════════
+
+class RecordsDB:
+    """管理个人餐食记录、目标、体重"""
+
     def __init__(self, db_path=None):
-        self.db_path = db_path or DB_PATH
+        self.db_path = db_path or RECORDS_DB
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
     @contextmanager
@@ -80,7 +367,7 @@ class CalorieDB:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(SCHEMA)
+        conn.executescript(RECORDS_SCHEMA)
         try:
             yield conn
             conn.commit()
@@ -140,29 +427,12 @@ class CalorieDB:
             "fiber_pct": round(totals["fiber_g"] / macro["fiber_g"] * 100, 1) if macro.get("fiber_g") else 0,
         }
 
-    def _format_custom_food(self, row):
-        return {
-            "id": row["id"],
-            "name": row["name"],
-            "barcode": row["barcode"],
-            "brand": row["brand"],
-            "serving_size_g": row["serving_size_g"],
-            "serving_desc": row["serving_desc"],
-            "calories_per_100g": round(row["calories_per_100g"] or 0, 1),
-            "carbs_per_100g": round(row["carbs_per_100g"] or 0, 1),
-            "protein_per_100g": round(row["protein_per_100g"] or 0, 1),
-            "fat_per_100g": round(row["fat_per_100g"] or 0, 1),
-            "fiber_per_100g": round(row["fiber_per_100g"] or 0, 1),
-            "added_date": row["added_date"],
-        }
-
     # ─── 餐食记录 ───────────────────────────────────────────────
 
     def add_meal(self, foods, meal_type="", image_desc=""):
         if not foods:
             raise ValueError("没有食物数据")
 
-        # 兼容两种字段名: "carbs" (输入JSON) 和 "carbs_g" (标准字段)
         def _get(food, *keys):
             for k in keys:
                 v = food.get(k)
@@ -306,365 +576,97 @@ class CalorieDB:
                         return v
                 return 0
 
-            fields.append("total_calories = ?"); vals.append(sum(f.get("calories", 0) for f in foods))
-            fields.append("total_carbs = ?"); vals.append(sum(_get(f, "carbs_g", "carbs") for f in foods))
-            fields.append("total_protein = ?"); vals.append(sum(_get(f, "protein_g", "protein") for f in foods))
-            fields.append("total_fat = ?"); vals.append(sum(_get(f, "fat_g", "fat") for f in foods))
-            fields.append("total_fiber = ?"); vals.append(sum(_get(f, "fiber_g", "fiber") for f in foods))
-        if "image_desc" in data:
-            fields.append("image_desc = ?"); vals.append(data["image_desc"])
-
+            total_cal = sum(f.get("calories", 0) for f in foods)
+            total_carbs = sum(_get(f, "carbs_g", "carbs") for f in foods)
+            total_protein = sum(_get(f, "protein_g", "protein") for f in foods)
+            total_fat = sum(_get(f, "fat_g", "fat") for f in foods)
+            total_fiber = sum(_get(f, "fiber_g", "fiber") for f in foods)
+            fields.extend([
+                "total_calories = ?", "total_carbs = ?",
+                "total_protein = ?", "total_fat = ?", "total_fiber = ?",
+            ])
+            vals.extend([total_cal, total_carbs, total_protein, total_fat, total_fiber])
         if not fields:
-            return {"status": "error", "message": "没有要更新的字段"}
-
+            return {"status": "error", "message": "没有更新字段"}
         vals.append(int(meal_id))
         with self._conn() as db:
             db.execute(f"UPDATE meals SET {', '.join(fields)} WHERE id = ?", vals)
-            affected = db.execute("SELECT changes()").fetchone()[0]
-        if affected:
-            return {"status": "ok", "updated_id": int(meal_id), "message": f"已更新记录 #{meal_id}"}
-        return {"status": "error", "message": f"未找到 ID 为 {meal_id} 的记录"}
+        return {"status": "ok", "updated_id": int(meal_id)}
+
+    def repeat(self, n=1):
+        with self._conn() as db:
+            row = db.execute(
+                "SELECT * FROM meals ORDER BY id DESC LIMIT 1 OFFSET ?", (n - 1,)
+            ).fetchone()
+        if not row:
+            return {"status": "error", "message": f"没有第{n}条记录"}
+        foods = json.loads(row["foods_json"])
+        return self.add_meal(foods, meal_type=row["meal_type"])
 
     def delete_last(self):
         with self._conn() as db:
-            row = db.execute("SELECT id, foods_json FROM meals ORDER BY id DESC LIMIT 1").fetchone()
+            row = db.execute("SELECT id FROM meals ORDER BY id DESC LIMIT 1").fetchone()
             if not row:
-                return {"status": "error", "message": "没有可删除的记录"}
+                return {"status": "error", "message": "没有记录可删除"}
             db.execute("DELETE FROM meals WHERE id = ?", (row["id"],))
-            foods = json.loads(row["foods_json"])
-            names = ", ".join(f["name"] for f in foods)
-        return {"status": "ok", "message": f"已删除最后一条记录：{names}", "deleted_id": row["id"]}
-
-    def repeat(self, n=1):
-        offset = int(n) - 1
-        with self._conn() as db:
-            row = db.execute(
-                "SELECT * FROM meals ORDER BY id DESC LIMIT 1 OFFSET ?", (offset,)
-            ).fetchone()
-            if not row:
-                return {"status": "error", "message": f"没有找到第 {n} 条记录"}
-
-            foods = json.loads(row["foods_json"])
-            meal_type = row["meal_type"]
-            total_cal = sum(f.get("calories", 0) for f in foods)
-            total_carbs = sum(f.get("carbs_g", 0) for f in foods)
-            total_protein = sum(f.get("protein_g", 0) for f in foods)
-            total_fat = sum(f.get("fat_g", 0) for f in foods)
-            total_fiber = sum(f.get("fiber_g", 0) for f in foods)
-
-            db.execute(
-                "INSERT INTO meals (meal_type, foods_json, total_calories, total_carbs, total_protein, total_fat, total_fiber) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (meal_type, row["foods_json"], total_cal, total_carbs, total_protein, total_fat, total_fiber),
-            )
-            new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            goal = self._get_macro_goal(db)["calorie"]
-            today_cal = db.execute(
-                "SELECT COALESCE(SUM(total_calories),0) FROM meals WHERE meal_time >= ?",
-                (self._today_str(),),
-            ).fetchone()[0]
-
-        return {
-            "status": "ok", "meal_id": new_id, "meal_type": meal_type, "foods": foods,
-            "totals": {"calories": round(total_cal, 1), "carbs_g": round(total_carbs, 1),
-                       "protein_g": round(total_protein, 1), "fat_g": round(total_fat, 1),
-                       "fiber_g": round(total_fiber, 1)},
-            "today": {"calories": round(today_cal, 1), "goal": goal,
-                      "remaining": round(goal - today_cal, 1),
-                      "progress_pct": round(today_cal / goal * 100, 1) if goal else 0},
-            "message": "已复刻最近一餐",
-        }
+        return {"status": "ok", "deleted_id": row["id"], "message": "已删除最后一条记录"}
 
     def recent_foods(self, limit=10):
         with self._conn() as db:
             rows = db.execute(
-                "SELECT foods_json FROM meals ORDER BY id DESC LIMIT ?", (int(limit),)
+                "SELECT foods_json, meal_time FROM meals ORDER BY id DESC LIMIT ?", (limit * 3,)
             ).fetchall()
-        seen = set()
-        unique = []
+        food_counts = {}
         for r in rows:
             for f in json.loads(r["foods_json"]):
-                if f["name"] not in seen:
-                    seen.add(f["name"])
-                    unique.append(f["name"])
-        return {"status": "ok", "recent_foods": unique[:20]}
+                name = f.get("name", "")
+                if name:
+                    food_counts[name] = food_counts.get(name, 0) + 1
+        sorted_foods = sorted(food_counts.items(), key=lambda x: -x[1])[:limit]
+        return {"status": "ok", "foods": [{"name": n, "count": c} for n, c in sorted_foods]}
 
-    # ─── 热量/宏量目标 ──────────────────────────────────────────
+    # ─── 目标 ───────────────────────────────────────────────────
 
     def goal_set(self, value):
-        goal = int(value)
         with self._conn() as db:
-            db.execute("INSERT INTO goals (calorie_goal) VALUES (?)", (goal,))
-        return {"status": "ok", "goal": goal, "message": f"热量目标已更新为 {goal} kcal/天"}
+            db.execute("INSERT INTO goals (calorie_goal) VALUES (?)", (int(value),))
+        return {"status": "ok", "goal": int(value)}
 
     def goal_get(self):
         with self._conn() as db:
             row = db.execute("SELECT calorie_goal FROM goals ORDER BY id DESC LIMIT 1").fetchone()
         return {"status": "ok", "goal": row["calorie_goal"] if row else 2000}
 
+    def macro_set(self, **kwargs):
+        with self._conn() as db:
+            current = self._get_macro_goal(db)
+            for k in ["protein_g", "carbs_g", "fat_g", "fiber_g", "calorie"]:
+                if k in kwargs:
+                    current[k] = float(kwargs[k])
+            db.execute(
+                "INSERT INTO macro_goals (calorie, protein_g, carbs_g, fat_g, fiber_g) VALUES (?,?,?,?,?)",
+                (current["calorie"], current.get("protein_g"), current.get("carbs_g"),
+                 current.get("fat_g"), current.get("fiber_g")),
+            )
+        return {"status": "ok", "macro": current, "message": f"宏量目标已更新"}
+
     def macro_get(self):
         with self._conn() as db:
             return {"status": "ok", "macro": self._get_macro_goal(db)}
 
-    def macro_set(self, **kwargs):
-        """统一的多字段宏量目标设置。kwargs key: calorie, protein, carbs, fat, fiber"""
-        col_map = {
-            "protein": "protein_g", "carbs": "carbs_g", "fat": "fat_g",
-            "fiber": "fiber_g", "calorie": "calorie",
-        }
+    # ─── 体重 ───────────────────────────────────────────────────
+
+    def weight_add(self, kg, note=""):
         with self._conn() as db:
-            current = self._get_macro_goal(db)
-            update = {
-                "calorie": current["calorie"],
-                "protein_g": current["protein_g"],
-                "carbs_g": current["carbs_g"],
-                "fat_g": current["fat_g"],
-                "fiber_g": current["fiber_g"],
-            }
-            for raw_key, raw_val in kwargs.items():
-                col = col_map.get(raw_key, raw_key)
-                update[col] = float(raw_val)
-
-            db.execute(
-                "INSERT INTO macro_goals (calorie, protein_g, carbs_g, fat_g, fiber_g) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (update["calorie"], update["protein_g"], update["carbs_g"],
-                 update["fat_g"], update["fiber_g"]),
-            )
-
-        msg_parts = []
-        for k, v in update.items():
-            unit = "kcal" if k == "calorie" else "g"
-            msg_parts.append(f"{k.replace('_g','')} {v:.0f}{unit}")
-
-        return {
-            "status": "ok",
-            "macro": {k: round(v, 1) for k, v in update.items()},
-            "message": f"宏量目标已更新：{', '.join(msg_parts)}",
-        }
-
-    # ─── 自定义食物 ─────────────────────────────────────────────
-
-    def food_add(self, data):
-        if not data.get("name"):
-            return {"status": "error", "message": "食物名称不能为空"}
-
-        with self._conn() as db:
-            try:
-                db.execute(
-                    """INSERT INTO custom_foods
-                       (name, barcode, brand, serving_size_g, serving_desc,
-                        calories_per_100g, carbs_per_100g, protein_per_100g,
-                        fat_per_100g, fiber_per_100g, image_desc)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (data["name"], data.get("barcode"), data.get("brand", ""),
-                     data.get("serving_size_g"), data.get("serving_desc", ""),
-                     data.get("calories_per_100g", 0), data.get("carbs_per_100g", 0),
-                     data.get("protein_per_100g", 0), data.get("fat_per_100g", 0),
-                     data.get("fiber_per_100g", 0), data.get("image_desc", "")),
-                )
-                food_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            except sqlite3.IntegrityError:
-                return {"status": "error", "message": f"条码 {data.get('barcode')} 已存在"}
-
-        return {
-            "status": "ok", "food_id": food_id, "name": data["name"],
-            "barcode": data.get("barcode"),
-            "message": f"已录入食物：{data['name']}" +
-                       (f"（条码：{data['barcode']}）" if data.get("barcode") else ""),
-        }
-
-    @staticmethod
-    def _ngram_chunks(keyword, size=2):
-        """将关键词切成 n-gram 片段用于宽松匹配"""
-        if len(keyword) <= size:
-            return [keyword]
-        return [keyword[i:i+size] for i in range(len(keyword) - size + 1)]
-
-    @staticmethod
-    def _fuzzy_score(keyword, target):
-        """综合 N-gram 命中率 + 字符交集比 + partial_ratio 评分
-
-        中文没有空格分词，token_set_ratio 效果差，
-        改用字符集交集比例 + partial_ratio 组合更适合中文食物名。
-        """
-        # 1) N-gram 命中分
-        chunks = CalorieDB._ngram_chunks(keyword)
-        ngram_score = sum(1 for c in chunks if c in target) / len(chunks) * 100 if chunks else 0
-
-        # 2) 字符交集比 (keyword 中有多少字符出现在 target 中)
-        kw_chars = set(keyword)
-        tgt_chars = set(target)
-        char_overlap = len(kw_chars & tgt_chars) / len(kw_chars) * 100 if kw_chars else 0
-
-        # 3) partial_ratio (子串模糊匹配)
-        partial = fuzz.partial_ratio(keyword, target)
-
-        # 加权：字符交集 35% + N-gram 25% + partial_ratio 40%
-        return char_overlap * 0.35 + ngram_score * 0.25 + partial * 0.40
-
-    def food_search(self, keyword):
-        """模糊搜索自定义食物：N-gram + RapidFuzz 综合评分"""
-        with self._conn() as db:
-            rows = db.execute("SELECT * FROM custom_foods ORDER BY name ASC").fetchall()
-
-        if not rows:
-            return {"status": "ok", "foods": [], "message": "自定义食物库为空"}
-
-        # 计算每条的综合得分
-        scored = []
-        for r in rows:
-            score = self._fuzzy_score(keyword, r["name"])
-            if score >= 45:  # 最低阈值：卡掉单字误匹配
-                scored.append((score, r))
-
-        # 按得分降序，取 Top 5
-        scored.sort(key=lambda x: -x[0])
-        foods = [self._format_custom_food(r) for _, r in scored[:5]]
-
-        if not foods:
-            return {"status": "ok", "foods": [], "message": f"未找到与「{keyword}」匹配的食物"}
-        return {"status": "ok", "foods": foods}
-
-    def food_barcode(self, barcode):
-        with self._conn() as db:
-            row = db.execute(
-                "SELECT * FROM custom_foods WHERE barcode = ?", (barcode,)
-            ).fetchone()
-        if not row:
-            return {"status": "not_found", "barcode": barcode,
-                    "message": f"未找到条码 {barcode} 对应的食物，可以拍照营养表录入"}
-
-        food = self._format_custom_food(row)
-        serving = None
-        if food["serving_size_g"]:
-            sf = food["serving_size_g"] / 100
-            serving = {
-                "calories": round(food["calories_per_100g"] * sf, 1),
-                "carbs_g": round(food["carbs_per_100g"] * sf, 1),
-                "protein_g": round(food["protein_per_100g"] * sf, 1),
-                "fat_g": round(food["fat_per_100g"] * sf, 1),
-                "fiber_g": round(food["fiber_per_100g"] * sf, 1),
-            }
-        return {"status": "found", "food": food, "per_serving": serving}
-
-    def food_list(self):
-        with self._conn() as db:
-            rows = db.execute(
-                "SELECT * FROM custom_foods ORDER BY added_date DESC"
-            ).fetchall()
-        foods = [self._format_custom_food(r) for r in rows]
-        return {"status": "ok", "count": len(foods), "foods": foods}
-
-    def food_delete(self, food_id):
-        with self._conn() as db:
-            db.execute("DELETE FROM custom_foods WHERE id = ?", (int(food_id),))
-            affected = db.execute("SELECT changes()").fetchone()[0]
-        if affected:
-            return {"status": "ok", "message": f"已删除食物（ID: {food_id}）"}
-        return {"status": "error", "message": f"未找到 ID 为 {food_id} 的食物"}
-
-    def food_update(self, food_id, data):
-        allowed = [
-            "name", "barcode", "brand", "serving_size_g", "serving_desc",
-            "calories_per_100g", "carbs_per_100g", "protein_per_100g",
-            "fat_per_100g", "fiber_per_100g",
-        ]
-        sets, vals = [], []
-        for f in allowed:
-            if f in data:
-                sets.append(f"{f} = ?"); vals.append(data[f])
-        if not sets:
-            return {"status": "error", "message": "没有要更新的字段"}
-
-        vals.append(int(food_id))
-        with self._conn() as db:
-            db.execute(f"UPDATE custom_foods SET {', '.join(sets)} WHERE id = ?", vals)
-            affected = db.execute("SELECT changes()").fetchone()[0]
-        if affected:
-            return {"status": "ok", "message": f"已更新食物（ID: {food_id}）"}
-        return {"status": "error", "message": f"未找到 ID 为 {food_id} 的食物"}
-
-    # ─── foods.csv 查询 ─────────────────────────────────────────
-
-    def foods_lookup(self, keyword):
-        """在 foods.csv 中模糊搜索食物参考数据"""
-        if not os.path.exists(FOODS_CSV):
-            return {"status": "error", "message": "foods.csv 不存在"}
-
-        import csv
-        all_items = []
-        with open(FOODS_CSV, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                all_items.append({
-                    "category": row.get("分类", ""),
-                    "name": row["食物名称"],
-                    "calories": float(row.get("每100g热量(kcal)", 0)),
-                    "carbs_g": float(row.get("碳水(g)", 0)),
-                    "protein_g": float(row.get("蛋白质(g)", 0)),
-                    "fat_g": float(row.get("脂肪(g)", 0)),
-                    "fiber_g": float(row.get("膳食纤维(g)", 0)),
-                    "note": row.get("备注", ""),
-                })
-
-        # 模糊评分
-        scored = []
-        for item in all_items:
-            score = self._fuzzy_score(keyword, item["name"])
-            if score >= 45:
-                scored.append((score, item))
-
-        scored.sort(key=lambda x: -x[0])
-        results = [item for _, item in scored[:10]]
-
-        return {"status": "ok", "keyword": keyword, "count": len(results), "foods": results}
-
-    # ─── 体重记录 ───────────────────────────────────────────────
-
-    def weight_add(self, weight_kg, note=""):
-        try:
-            weight = float(weight_kg)
-        except (ValueError, TypeError):
-            return {"status": "error", "message": f"无效的体重值: {weight_kg}"}
-
-        with self._conn() as db:
-            db.execute(
-                "INSERT INTO weight_records (weight, note) VALUES (?, ?)", (weight, note)
-            )
-            record_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            prev = db.execute(
-                "SELECT weight FROM weight_records WHERE id < ? ORDER BY id DESC LIMIT 1",
-                (record_id,),
-            ).fetchone()
-            change = round(weight - prev["weight"], 1) if prev else 0
-
-            week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            week_rows = db.execute(
-                "SELECT weight, recorded_at FROM weight_records WHERE recorded_at >= ? ORDER BY recorded_at ASC",
-                (week_ago,),
-            ).fetchall()
-
-        result = {"status": "ok", "weight": weight, "record_id": record_id,
-                  "note": note, "change_vs_last": change}
-        if len(week_rows) >= 2:
-            first_w, last_w = week_rows[0]["weight"], week_rows[-1]["weight"]
-            if last_w != first_w:
-                result["trend_7d"] = {"start": first_w, "end": last_w,
-                                      "change": round(last_w - first_w, 1)}
-        return result
+            db.execute("INSERT INTO weight_records (weight, note) VALUES (?, ?)", (float(kg), note))
+        return {"status": "ok", "weight": float(kg)}
 
     def weight_list(self, days=30):
-        since = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d")
         with self._conn() as db:
             rows = db.execute(
-                "SELECT * FROM weight_records WHERE recorded_at >= ? ORDER BY recorded_at DESC",
-                (since,),
+                "SELECT * FROM weight_records ORDER BY id DESC LIMIT ?", (int(days),)
             ).fetchall()
-        records = [{"id": r["id"], "weight": r["weight"],
-                    "recorded_at": r["recorded_at"], "note": r["note"]} for r in rows]
-        return {"status": "ok", "count": len(records), "records": records}
+        return {"status": "ok", "records": [dict(r) for r in rows]}
 
     def weight_latest(self):
         with self._conn() as db:
@@ -744,7 +746,99 @@ class CalorieDB:
     def stats(self):
         with self._conn() as db:
             meals = db.execute("SELECT COUNT(*) as c FROM meals").fetchone()["c"]
-            foods = db.execute("SELECT COUNT(*) as c FROM custom_foods").fetchone()["c"]
             weights = db.execute("SELECT COUNT(*) as c FROM weight_records").fetchone()["c"]
-        return {"status": "ok", "total_meals": meals, "custom_foods": foods,
-                "weight_records": weights}
+        return {"status": "ok", "total_meals": meals, "weight_records": weights}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 向后兼容：CalorieDB 委托给 FoodsDB + RecordsDB
+# ═══════════════════════════════════════════════════════════════
+
+class CalorieDB:
+    """向后兼容的门面类，委托给 FoodsDB + RecordsDB"""
+
+    def __init__(self, db_path=None):
+        self.foods = FoodsDB()
+        self.records = RecordsDB(db_path)
+
+    # ─── 食物查询（委托 FoodsDB）───────────────────────────────
+
+    def foods_lookup(self, keyword):
+        return self.foods.lookup(keyword)
+
+    def food_search(self, keyword):
+        return self.foods.food_search(keyword)
+
+    def food_barcode(self, code):
+        return self.foods.food_barcode(code)
+
+    def food_add(self, data):
+        return self.foods.food_add(data)
+
+    def food_update(self, food_id, data):
+        return self.foods.food_update(food_id, data)
+
+    def food_delete(self, food_id):
+        return self.foods.food_delete(food_id)
+
+    def food_list(self):
+        return self.foods.food_list()
+
+    # ─── 个人记录（委托 RecordsDB）─────────────────────────────
+
+    def add_meal(self, foods, meal_type="", image_desc=""):
+        return self.records.add_meal(foods, meal_type, image_desc)
+
+    def summary(self, period="today"):
+        return self.records.summary(period)
+
+    def meal_list(self, date_str="today"):
+        return self.records.meal_list(date_str)
+
+    def meal_delete(self, meal_id):
+        return self.records.meal_delete(meal_id)
+
+    def meal_update(self, meal_id, data):
+        return self.records.meal_update(meal_id, data)
+
+    def repeat(self, n=1):
+        return self.records.repeat(n)
+
+    def delete_last(self):
+        return self.records.delete_last()
+
+    def recent_foods(self, limit=10):
+        return self.records.recent_foods(limit)
+
+    def goal_set(self, value):
+        return self.records.goal_set(value)
+
+    def goal_get(self):
+        return self.records.goal_get()
+
+    def macro_set(self, **kwargs):
+        return self.records.macro_set(**kwargs)
+
+    def macro_get(self):
+        return self.records.macro_get()
+
+    def weight_add(self, kg, note=""):
+        return self.records.weight_add(kg, note)
+
+    def weight_list(self, days=30):
+        return self.records.weight_list(days)
+
+    def weight_latest(self):
+        return self.records.weight_latest()
+
+    def health_export(self, period="today", date_str=None):
+        return self.records.health_export(period, date_str)
+
+    def checkpoint(self):
+        return self.records.checkpoint()
+
+    def stats(self):
+        r = self.records.stats()
+        f = self.foods.food_list()
+        r["custom_foods"] = len(f.get("foods", []))
+        return r
